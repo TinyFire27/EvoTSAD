@@ -1,0 +1,23 @@
+default_model = "cas/gpt-6-luna"
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.openai.models."gpt-6-luna"]
+reasoning = "medium"
+
+[providers.qwen]
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+
+[providers.qwen.models."qwen3.8-27b"]
+reasoning = "xhigh"
+temperature = 1.0
+
+[providers.cas]
+base_url = "https://yyt.s-flag.com/v1"
+api_key_env = "CAS_API_KEY"
+
+[providers.cas.models."gpt-6-luna"]
+reasoning = "medium"
