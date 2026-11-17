@@ -12,6 +12,7 @@ from .agent.core import DefaultAgent, EmptyModelResponseError
 from .models import ResponseModel
 from .models.router import resolve_model_config
 from .runtime import SessionStore
+from .runtime.skills import SkillsManager
 from .tools import ToolExecutor
 from .tools.files import image_data_url
 from .utils.terminal import ChatTerminal
@@ -65,7 +66,11 @@ def main() -> int:
     workspace = Path.cwd().resolve()
     tools = ToolExecutor(workspace=workspace)
     terminal = ChatTerminal()
-    instructions = DEFAULT_INSTRUCTIONS  # 后续改成系统提示词加载器
+    skills = SkillsManager(workspace)
+    skills.discover()
+    instructions = DEFAULT_INSTRUCTIONS
+    if skill_instructions := skills.format_prompt_block():
+        instructions += f"\n\n{skill_instructions}"
     agent: DefaultAgent | None = None
 
     # 默认配置
@@ -164,6 +169,11 @@ def main() -> int:
                     sessions = SessionStore.list_sessions(ROOT_PATH, workspace)
                     terminal.show_sessions(sessions)
                     continue
+
+                elif command == "/prompt":
+                    terminal.print_info(instructions)
+                    continue
+
             else:
                 terminal.echo_user(user_input)
 

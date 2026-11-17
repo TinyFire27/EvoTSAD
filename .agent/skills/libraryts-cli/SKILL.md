@@ -1,27 +1,36 @@
 ---
 name: libraryts-cli
-description: Use the native LibraryTS CLI for time-series anomaly detection. Discover detectors and preprocessors, build experiment specs, train and save pipelines, score new CSV data with saved models, and evaluate labeled experiments. This skill applies to the installed libraryts entry point backed by playground.cli.
+description: Develop and evaluate time-series anomaly detectors from local CSV data. This skill explains how to use the LibraryTS command-line tool (`libraryts`) to choose detectors and preprocessors, configure an experiment, train and save a pipeline, score new data, and evaluate the results when labels are available.
 ---
 
-# LibraryTS CLI
+# LibraryTS CLI User Guide
 
-使用新版 `libraryts` 命令完成异常检测任务。先确认 `libraryts --help` 显示 `ls`、`train`、`predict`、`evaluate` 和 `run`。本 skill 对应 `playground.cli` 入口。
+## Purpose
 
-## 按目标选命令
+This skill is the companion guide for the `libraryts` command-line tool. Use it to develop time-series anomaly detectors from local CSV files supplied by the user. You can discover components, assemble a detection pipeline, train and save it, score data with the saved pipeline, and compute metrics when the evaluation CSV contains labels. Run `libraryts --help` to verify that the CLI is available.
 
-| 任务 | 命令 | 结果 |
-|---|---|---|
-| 查询检测器或预处理器 | `ls algorithms` / `ls preprocessors`，带 `--task anomaly_detection` | 可选类名和简介 |
-| 已知要用哪个类 | 在对应的 `ls` 命令追加 `--name CLASS` | 构造参数、必填项和默认值 |
-| 训练并交付模型或管线 | `train` | `model.zip` 和 `manifest.json` |
-| 用已保存模型对新数据打分 | `predict` | `scores.csv` |
-| 用已有分数和测试标签算指标 | `evaluate` | `metrics.json` |
-| 一次执行训练、打分和带标签评估 | `run` | 三阶段的产物和本轮 manifest |
+## Available Commands
 
-已知目标类时，直接查询该类的详情。编写或调整 `--spec` 时读 [实验配置](references/experiment-spec.md)。执行命令、传递产物或排查失败时读 [命令与产物](references/commands-and-artifacts.md)。
+| Command | Purpose |
+|---|---|
+| `libraryts ls` | Discover available detectors and preprocessors. |
+| `libraryts train` | Train and save a detector or pipeline. |
+| `libraryts predict` | Load a saved detector or pipeline and generate anomaly scores. |
+| `libraryts evaluate` | Compute metrics from saved scores and the corresponding labels. |
+| `libraryts run` | Train, score, and evaluate in one command, saving the outputs of all three stages. |
 
-## 执行约定
+## Minimal Workflow for One Experiment
 
-- 每次执行使用新的输出目录。以退出码判断成功或失败，从 `stdout` 读取结果 JSON，保留返回的目录路径用于下一步。需要定位执行错误时，在子命令前加 `--debug` 并查看 `stderr`。
-- 复用已训练模型时调用 `predict` 并传入可信的模型目录。已有分数时可直接调用 `evaluate`。
-- 在无标签模型选择阶段，只使用研究协议允许的数据和反馈。真实测试标签上的 `evaluate` 和 `run` 留给独立评估阶段。
+**The experiment spec is the entry point for an experiment.** Create a JSON file that specifies the data, ordered pipeline, parameters, and metrics for the experiment. Pass the file path to the CLI with `--spec`.
+
+1. **Discover components.** Run `libraryts ls algorithms --task anomaly_detection` to list detectors. Add `--name CLASS` with the exact class name to see its parameters, defaults, and recommended preprocessing.
+2. **Write the spec.** Create `exp-01.json` using the experiment spec reference. A complete `run` needs a training CSV, a separate labeled CSV for scoring and evaluation, the ordered pipeline, and at least one metric. Put any preprocessing steps before the detector. Use the data splits and labels allowed by the task.
+3. **Run and inspect the results.** Execute `libraryts run --spec exp-01.json --output-dir outputs/exp-01` from the experiment workspace. Choose an output directory that does not exist yet. On success, read the metrics and artifact paths from the JSON on stdout. Use `libraryts train` if the task only requires a fitted detector or pipeline.
+
+## Reference Index
+
+| When to read | Reference |
+|---|---|
+| Before invoking a command, read its syntax, options, and error-handling rules. | [Commands](references/commands.md) |
+| Before writing or editing a spec, read its fields, CSV requirements, and path rules. | [Experiment Spec](references/experiment-spec.md) |
+| Before choosing an output directory or reusing an artifact, read the file layout and directory handoff rules. | [Files and Artifacts](references/artifacts.md) |

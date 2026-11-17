@@ -1,53 +1,44 @@
-# 实验配置
+# Experiment Spec
 
-`--spec` 接收 UTF-8 JSON 文件路径。命令参数和配置中的相对数据路径都按运行命令时的工作目录解析。移动 spec 文件时，仍以命令的工作目录为基准。
+Pass the path to a UTF-8 JSON file with `--spec`. Use the working directory of the CLI invocation as the base for relative paths, including paths inside the JSON. Keep the same working directory across stages when reusing a spec with relative paths.
 
-## 各阶段读取的字段
+## Fields by command
 
-| 命令 | 使用的字段 |
-|---|---|
-| `train` | `task`、`data.train`、`estimator`，以及可选的 `data.val`、`seed`、`fit_params` |
-| `predict` | `task`、`data.test`。模型与已拟合的预处理由 `--model-dir` 提供 |
-| `evaluate` | `task`、`data.test`、`metrics`。分数由 `--prediction-dir` 提供 |
-| `run` | 上述字段的并集。必须显式提供不同的 train/test 文件，并选择至少一个指标 |
+| Command | Required spec fields | Optional spec fields |
+|---|---|---|
+| `train` | `task`, `data.train`, `estimator` | `data.val`, `seed`, `fit_params` |
+| `predict` | `task`, `data.test` | |
+| `evaluate` | `task`, `data.test`, `metrics` | |
+| `run` | `task`, `data.train`, `data.test`, `estimator`, `metrics` | `data.val`, `seed`, `fit_params` |
 
-- `task` 填 `"anomaly_detection"`。
-- CSV 第一行为列名。单变量输入提供一列数值，例如 `value`。可选的 `timestamp` 列会作为索引，省略时使用行号。打分按输入顺序，评估要求测试标签与分数的索引和顺序一致。
-- 带标签评估时，测试 CSV 包含 `label` 列。训练和打分都从模型输入中去除该列，评估才读取它。使用 VUS-PR 时测试标签应包含正常点 `0` 和异常点 `1`。
-- 单步 `estimator` 也写成数组。管线按数组顺序执行，最后一步是检测器，前面的步骤是预处理器。每步用精确的短类名 `class`，构造参数放在可选的 `init_params`。可用 `ls ... --name` 查询签名，补齐标为 `"required"` 的参数。
-- 顶层 `seed` 可选。提供后会覆盖各步骤支持的 `seed` 或 `random_state`。深度检测器可用 `fit_params.show_progress` 控制训练进度。早停等构造参数仍在检测器的 `init_params` 内。
-- `metrics` 是从指标名到参数对象的映射，例如 `{"VUS-PR": {}}`。空对象表示用默认参数。
-- 独立阶段可以使用可解析的 `data.dataset_id`。注册 ID 指向整条序列，当前没有独立的训练集和测试集划分。ID 与本地 split 路径二选一。需要 held-out 评估时准备明确分开的本地 CSV。
+- Set `task` to `"anomaly_detection"`.
+- Use `data.train` for fitting, `data.val` for optional validation during fitting, and `data.test` for the series to score or evaluate in this invocation. For `run`, provide different files for `data.train` and `data.test`, and use a labeled `data.test`. The task protocol determines which data and labels the Agent can use.
+- Write `estimator` as an ordered array, even for a single detector. Each step needs a `class` with the exact short class name. Put any preprocessors before the detector. Use the optional `params` object for constructor parameters that the component requires or that you want to override. Query current defaults with `libraryts ls ... --name CLASS`. Include the applicable preprocessing steps explicitly.
+- Use the optional top-level `seed` to override `seed` or `random_state` on components that accept either. Use `fit_params.show_progress` for progress output on supported detectors. Early stopping settings belong in the detector step's `params`.
+- Set `metrics` to an object mapping metric names to parameter objects. An empty parameter object uses the metric defaults. For example, `{"VUS-PR": {"sliding_window": 100}, "Point-F1": {}}` requests two metrics. `run` needs at least one metric.
 
-## StandardScaler → Donut 示例
+## Local CSV format
 
-将下列内容保存为当前工作目录下的 `experiment.json`。准备对应的 CSV 文件。验证集可省略，带标签测试集用于 `evaluate` 或 `run`。示例使用 CPU 和一轮训练，适合验证调用链。正式实验按任务设置模型参数和评估协议。
+- Include a header and one numeric value column for a univariate series, such as `value`. An optional `timestamp` column supplies the index. Without it, row numbers are used. Prepare the rows in time order.
+- For evaluation, put the binary ground-truth `label` column in the same `data.test` CSV as the values. Use `0` for normal and `1` for anomalous. VUS-PR requires both classes. Training and scoring use the value columns and exclude `label` from the model inputs.
+- Evaluate scores against the same CSV used for prediction, with matching row order and index. A registered dataset ID can refer to an unsplit CSV in standalone commands. Use explicit local split paths for `run`.
+
+## Minimal complete example
+
+Save this as `exp-01.json` in the working directory. The example uses `StandardScaler` and `KMeansAD`. Use a training CSV with at least 16 rows and a scoring CSV with at least 8 rows and both label classes. Adjust paths, window length, and metric parameters to match the actual task.
 
 ```json
 {
   "task": "anomaly_detection",
-  "seed": 2026,
   "data": {
     "train": "data/train.csv",
-    "val": "data/val.csv",
     "test": "data/test.csv"
   },
   "estimator": [
     {"class": "StandardScaler"},
-    {
-      "class": "Donut",
-      "init_params": {
-        "win_len": 32,
-        "h_dim": 32,
-        "z_dim": 4,
-        "batch_size": 64,
-        "epochs": 1,
-        "mc_samples": 8,
-        "device": "cpu"
-      }
-    }
+    {"class": "KMeansAD", "params": {"win_len": 8, "k": 2}}
   ],
-  "fit_params": {"show_progress": true},
-  "metrics": {"VUS-PR": {}}
+  "seed": 2026,
+  "metrics": {"VUS-PR": {"sliding_window": 8}}
 }
 ```
