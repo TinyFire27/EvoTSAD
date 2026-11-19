@@ -1,11 +1,11 @@
 """Persist the settings and experiment history for one EvoTSAD task."""
 
-import fcntl
 import json
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
 from typing import Any, Literal, TextIO
+from .file_lock import locked
 
 
 class TaskState:
@@ -35,9 +35,10 @@ class TaskState:
 
     @property
     def history(self) -> list[dict[str, Any]]:
-        with self.history_path.open(encoding="utf-8") as stream:
-            fcntl.flock(stream, fcntl.LOCK_SH)
-            return self._read_history(stream)
+        # Use read/write mode so Windows can acquire its advisory lock.
+        with self.history_path.open("r+", encoding="utf-8") as stream:
+            with locked(stream, shared=True):
+                return self._read_history(stream)
 
     @property
     def recorded_trials(self) -> int:
@@ -55,24 +56,24 @@ class TaskState:
         """Register one candidate and return its ID, spec path, and output path."""
         content = json.dumps(spec, ensure_ascii=False, indent=2, allow_nan=False)
         with self.history_path.open("a+", encoding="utf-8") as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX)
-            history = self._read_history(stream)
-            number = 1 + sum(event["status"] == "created" for event in history)
-            experiment_dir = self.experiments_dir / f"exp-{number:03d}"
-            while experiment_dir.exists():
-                number += 1
+            with locked(stream):
+                history = self._read_history(stream)
+                number = 1 + sum(event["status"] == "created" for event in history)
                 experiment_dir = self.experiments_dir / f"exp-{number:03d}"
-            experiment_dir.mkdir()
-            spec_path = experiment_dir / "spec.json"
-            spec_path.write_text(content + "\n", encoding="utf-8")
-            experiment = {
-                "experiment_id": experiment_dir.name,
-                "spec_path": str(spec_path),
-                "output_dir": str(experiment_dir / "artifacts"),
-                "status": "created",
-                "reason": reason,
-            }
-            return self._append(stream, experiment)
+                while experiment_dir.exists():
+                    number += 1
+                    experiment_dir = self.experiments_dir / f"exp-{number:03d}"
+                experiment_dir.mkdir()
+                spec_path = experiment_dir / "spec.json"
+                spec_path.write_text(content + "\n", encoding="utf-8")
+                experiment = {
+                    "experiment_id": experiment_dir.name,
+                    "spec_path": str(spec_path),
+                    "output_dir": str(experiment_dir / "artifacts"),
+                    "status": "created",
+                    "reason": reason,
+                }
+                return self._append(stream, experiment)
 
     def get_experiment(self, experiment_id: str) -> dict[str, Any]:
         """Return the latest recorded state of one experiment."""
@@ -98,13 +99,13 @@ class TaskState:
 
         result = {"status": status, "metrics": metrics, "error": error}
         with self.history_path.open("a+", encoding="utf-8") as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX)
-            experiment = self._find_experiment(self._read_history(stream), experiment_id)
-            if experiment["status"] == "created":
-                return self._append(stream, {**experiment, **result})
-            if all(experiment[key] == value for key, value in result.items()):
-                return experiment
-            raise ValueError(f"Experiment already has a recorded result: {experiment_id}")
+            with locked(stream):
+                experiment = self._find_experiment(self._read_history(stream), experiment_id)
+                if experiment["status"] == "created":
+                    return self._append(stream, {**experiment, **result})
+                if all(experiment[key] == value for key, value in result.items()):
+                    return experiment
+                raise ValueError(f"Experiment already has a recorded result: {experiment_id}")
 
     @staticmethod
     def _find_experiment(history: list[dict[str, Any]], experiment_id: str) -> dict[str, Any]:

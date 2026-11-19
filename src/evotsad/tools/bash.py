@@ -6,11 +6,14 @@ import subprocess
 from contextlib import suppress
 from pathlib import Path
 
-from ..runtime.sandbox import MacOSSandbox
+from ..runtime.sandbox import CommandSandbox
 
 
 def run_bash(command: str, *, cwd: Path, timeout: int) -> dict:
-    sandbox = MacOSSandbox(workspace=cwd)
+    sandbox = CommandSandbox(workspace=cwd)
+    environment = os.environ.copy()
+    environment.update(sandbox.environment)
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     with subprocess.Popen(
         sandbox.wrap(command),
         cwd=sandbox.workspace,
@@ -20,13 +23,18 @@ def run_bash(command: str, *, cwd: Path, timeout: int) -> dict:
         text=True,
         encoding="utf-8",
         errors="replace",
-        start_new_session=True,
+        env=environment,
+        start_new_session=os.name != "nt",
+        creationflags=creationflags,
     ) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
             with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+                if os.name == "nt":
+                    process.kill()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
             if isinstance(exc, KeyboardInterrupt):
                 raise
             stdout, stderr = process.communicate()

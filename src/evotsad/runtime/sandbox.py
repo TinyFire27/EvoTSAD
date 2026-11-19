@@ -1,10 +1,12 @@
-"""Build a macOS filesystem sandbox for command execution."""
+"""Prepare a cross-platform command environment."""
 
 import json
+import os
+import shutil
 from pathlib import Path
 
 
-class MacOSSandbox:
+class CommandSandbox:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace.expanduser().resolve(strict=True)
         workspace_path = json.dumps(str(self.workspace), ensure_ascii=False)
@@ -30,24 +32,27 @@ class MacOSSandbox:
         )
 
     def wrap(self, command: str) -> list[str]:
-        """Run commands with caches and temporary files inside the workspace."""
+        """Build a command line using the strongest available shell isolation."""
         cache_dir = self.workspace / ".sandbox"
-        prepare = (
-            '/bin/mkdir -p "$TMPDIR" "$MPLCONFIGDIR" '
-            '"$NUMBA_CACHE_DIR" "$XDG_CACHE_HOME" || exit\n'
-        )
-        return [
-            "/usr/bin/sandbox-exec",
-            "-p",
-            self.profile,
-            "/usr/bin/env",
-            f"TMPDIR={cache_dir / 'tmp'}",
-            f"MPLCONFIGDIR={cache_dir / 'matplotlib'}",
-            f"NUMBA_CACHE_DIR={cache_dir / 'numba'}",
-            f"XDG_CACHE_HOME={cache_dir / 'cache'}",
-            "/bin/bash",
-            "--noprofile",
-            "--norc",
-            "-c",
-            prepare + command,
-        ]
+        for name in ("tmp", "matplotlib", "numba", "cache"):
+            (cache_dir / name).mkdir(parents=True, exist_ok=True)
+
+        bash = shutil.which("bash") if os.name != "nt" else None
+        sandbox_exec = shutil.which("sandbox-exec") if os.name == "posix" else None
+        if sandbox_exec:
+            return [sandbox_exec, "-p", self.profile, bash or "/bin/sh", "-c", command]
+        if bash:
+            return [bash, "--noprofile", "--norc", "-c", command]
+        if os.name == "nt":
+            return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command]
+        return ["/bin/sh", "-c", command]
+
+    @property
+    def environment(self) -> dict[str, str]:
+        cache_dir = self.workspace / ".sandbox"
+        return {
+            "TMPDIR": str(cache_dir / "tmp"),
+            "MPLCONFIGDIR": str(cache_dir / "matplotlib"),
+            "NUMBA_CACHE_DIR": str(cache_dir / "numba"),
+            "XDG_CACHE_HOME": str(cache_dir / "cache"),
+        }

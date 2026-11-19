@@ -1,11 +1,11 @@
 """Persist conversation history and a session index."""
 
-import fcntl
 import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+from .file_lock import locked
 
 from pydantic import BaseModel
 
@@ -115,12 +115,12 @@ class SessionStore:
     def _edit_index(self):
         """Serialize index updates and replace the index atomically."""
         with (self.session_dir / ".index.lock").open("a") as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-            index = self._read_index(self.index_path)
-            yield index
-            temporary_path = self.session_dir / "index.tmp"
-            temporary_path.write_text(
-                json.dumps(index, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            temporary_path.replace(self.index_path)
+            with locked(lock_file):
+                index = self._read_index(self.index_path)
+                yield index
+                temporary_path = self.session_dir / "index.tmp"
+                temporary_path.write_text(
+                    json.dumps(index, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                temporary_path.replace(self.index_path)
