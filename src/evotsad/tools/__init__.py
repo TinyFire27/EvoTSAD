@@ -8,6 +8,7 @@ from copy import deepcopy
 
 from openai.types.responses import ResponseFunctionCallOutputItemListParam
 
+from ..runtime.errors import HarnessExecutionError
 from .bash import run_bash
 from .files import read_file, read_image, write_file
 
@@ -81,6 +82,8 @@ class ToolExecutor:
         else:
             try:
                 result = handler(**json.loads(arguments))
+            except HarnessExecutionError:
+                raise
             except Exception as exc:
                 result = {"error": str(exc)}
 
