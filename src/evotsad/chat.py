@@ -12,17 +12,13 @@ from .agent.core import DefaultAgent, EmptyModelResponseError
 from .models import ResponseModel
 from .models.router import resolve_model_config
 from .runtime import SessionStore
-from .runtime.skills import SkillsManager
-from .tools import ToolExecutor
+from .runtime.bootstrap import build_instructions
+from .tools.experiments import ExperimentToolExecutor
 from .tools.files import image_data_url
 from .utils.terminal import ChatTerminal
 
 ROOT_PATH = Path(__file__).resolve().parents[2] / ".agent"
 MODEL_CONFIG_PATH = ROOT_PATH / "config.toml"
-DEFAULT_INSTRUCTIONS = (
-    "You are EvoTSAD, an assistant for time-series anomaly detection. "
-    "Use the available workspace tools as needed."
-)
 
 
 def image_message(image_url: str, caption: str) -> ResponseInputMessageContentListParam:
@@ -64,13 +60,9 @@ def parse_new_args(arguments: str) -> tuple[str | None, str | None]:
 def main() -> int:
     load_dotenv(ROOT_PATH / ".env")
     workspace = Path.cwd().resolve()
-    tools = ToolExecutor(workspace=workspace)
+    tools = ExperimentToolExecutor(workspace=workspace)
     terminal = ChatTerminal()
-    skills = SkillsManager(workspace)
-    skills.discover()
-    instructions = DEFAULT_INSTRUCTIONS
-    if skill_instructions := skills.format_prompt_block():
-        instructions += f"\n\n{skill_instructions}"
+    instructions = build_instructions(workspace)
     agent: DefaultAgent | None = None
 
     # 默认配置

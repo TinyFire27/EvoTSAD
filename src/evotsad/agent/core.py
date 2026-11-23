@@ -49,20 +49,18 @@ class DefaultAgent:
                 exc.add_note("DefaultAgent failed while requesting a model response.")
                 raise
 
+            # 收集工具调用
             tool_calls = [
                 item for item in response.output if item.type == "function_call"
             ]
+
             final_text = response.output_text if not tool_calls else None
             if not tool_calls and not final_text:
                 raise EmptyModelResponseError(
                     f"Model response {response.id} returned no final text."
                 )
 
-            self.session.write(response.output)
-            self.messages.extend(response.output)
-            if final_text:
-                return final_text
-
+            items = list(response.output)
             for call in tool_calls:
                 result = self.tools.execute(call.name, call.arguments)
                 tool_item = {
@@ -70,5 +68,8 @@ class DefaultAgent:
                     "call_id": call.call_id,
                     "output": result,
                 }
-                self.session.write(tool_item)
-                self.messages.append(tool_item)
+                items.append(tool_item)
+            self.session.write(items)
+            self.messages.extend(items)
+            if final_text:
+                return final_text

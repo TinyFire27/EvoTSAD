@@ -1,11 +1,28 @@
 """Persist the settings and experiment history for one EvoTSAD task."""
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
-from typing import Any, Literal, TextIO
+from shutil import rmtree
+from typing import Any, TextIO
+
+from .errors import HarnessExecutionError
 from .file_lock import locked
+
+
+@dataclass
+class PendingTrial:
+    """The reserved paths and history stream for one trial."""
+
+    trial_number: int
+    spec_path: Path
+    output_dir: Path
+    _history_stream: TextIO
+    _recorded: bool = field(default=False, init=False)
 
 
 class TaskState:
@@ -16,7 +33,9 @@ class TaskState:
         self.task_path = self.task_dir / "task.json"
         self.history_path = self.task_dir / "history.jsonl"
         self.experiments_dir = self.task_dir / "experiments"
+
         self.task = json.loads(self.task_path.read_text(encoding="utf-8"))
+        self.data: dict[str, str | None] = self.task.get("data", {})
         self.primary_metric: str = self.task["primary_metric"]
 
     @classmethod
@@ -35,15 +54,14 @@ class TaskState:
 
     @property
     def history(self) -> list[dict[str, Any]]:
-        # Use read/write mode so Windows can acquire its advisory lock.
-        with self.history_path.open("r+", encoding="utf-8") as stream:
+        with self.history_path.open("a+", encoding="utf-8") as stream:
             with locked(stream, shared=True):
                 return self._read_history(stream)
 
     @property
     def recorded_trials(self) -> int:
-        """Count registered experiments that have reached a terminal state."""
-        return sum(event["status"] != "created" for event in self.history)
+        """Count trials with a successful evaluation."""
+        return sum(event["status"] == "completed" for event in self.history)
 
     @property
     def best_experiment(self) -> dict[str, Any] | None:
@@ -52,60 +70,61 @@ class TaskState:
             completed, key=lambda event: event["metrics"][self.primary_metric], default=None
         )
 
-    def create_experiment(self, spec: dict[str, Any], *, reason: str = "") -> dict[str, Any]:
-        """Register one candidate and return its ID, spec path, and output path."""
-        content = json.dumps(spec, ensure_ascii=False, indent=2, allow_nan=False)
+    @contextmanager
+    def prepare_trial(self) -> Iterator[PendingTrial]:
+        """Reserve an experiment directory and clean it up if the trial is unrecorded."""
         with self.history_path.open("a+", encoding="utf-8") as stream:
             with locked(stream):
                 history = self._read_history(stream)
-                number = 1 + sum(event["status"] == "created" for event in history)
+                trial_number = 1 + sum(event["status"] == "completed" for event in history)
+                max_trials = self.task["max_trials"]
+                if trial_number > max_trials:
+                    raise ValueError(f"Trial budget reached ({max_trials}/{max_trials}).")
+
+                number = trial_number
                 experiment_dir = self.experiments_dir / f"exp-{number:03d}"
                 while experiment_dir.exists():
                     number += 1
                     experiment_dir = self.experiments_dir / f"exp-{number:03d}"
                 experiment_dir.mkdir()
-                spec_path = experiment_dir / "spec.json"
-                spec_path.write_text(content + "\n", encoding="utf-8")
-                experiment = {
-                    "experiment_id": experiment_dir.name,
-                    "spec_path": str(spec_path),
-                    "output_dir": str(experiment_dir / "artifacts"),
-                    "status": "created",
-                    "reason": reason,
-                }
-                return self._append(stream, experiment)
+                trial = PendingTrial(
+                    trial_number=trial_number,
+                    spec_path=experiment_dir / "spec.json",
+                    output_dir=experiment_dir / "artifacts",
+                    _history_stream=stream,
+                )
+                try:
+                    yield trial
+                finally:
+                    if not trial._recorded:
+                        rmtree(experiment_dir)
+
+    def record_trial(
+        self, trial: PendingTrial, metrics: dict[str, float], *, reason: str = ""
+    ) -> dict[str, Any]:
+        """Validate and record the metrics for an active trial."""
+        if trial._recorded or trial._history_stream.closed:
+            raise HarnessExecutionError("The trial is no longer pending.")
+        score = metrics.get(self.primary_metric)
+        if type(score) not in (int, float) or not isfinite(score):
+            raise HarnessExecutionError(f"Expected a finite {self.primary_metric} score.")
+
+        record = {
+            "experiment_id": trial.spec_path.parent.name,
+            "trial_number": trial.trial_number,
+            "spec_path": str(trial.spec_path),
+            "output_dir": str(trial.output_dir),
+            "status": "completed",
+            "reason": reason,
+            "metrics": metrics,
+        }
+        result = self._append(trial._history_stream, record)
+        trial._recorded = True
+        return result
 
     def get_experiment(self, experiment_id: str) -> dict[str, Any]:
         """Return the latest recorded state of one experiment."""
         return self._find_experiment(self.history, experiment_id)
-
-    def record_experiment(
-        self,
-        experiment_id: str,
-        *,
-        status: Literal["completed", "failed", "abandoned"] = "completed",
-        metrics: dict[str, float] | None = None,
-        error: str | None = None,
-    ) -> dict[str, Any]:
-        """Record a terminal result supplied by the experiment tool."""
-        if status not in {"completed", "failed", "abandoned"}:
-            raise ValueError(f"Invalid experiment status: {status}")
-        if status == "completed":
-            score = (metrics or {}).get(self.primary_metric)
-            if type(score) not in (int, float) or not isfinite(score):
-                raise ValueError(
-                    f"A completed experiment needs a finite {self.primary_metric} score."
-                )
-
-        result = {"status": status, "metrics": metrics, "error": error}
-        with self.history_path.open("a+", encoding="utf-8") as stream:
-            with locked(stream):
-                experiment = self._find_experiment(self._read_history(stream), experiment_id)
-                if experiment["status"] == "created":
-                    return self._append(stream, {**experiment, **result})
-                if all(experiment[key] == value for key, value in result.items()):
-                    return experiment
-                raise ValueError(f"Experiment already has a recorded result: {experiment_id}")
 
     @staticmethod
     def _find_experiment(history: list[dict[str, Any]], experiment_id: str) -> dict[str, Any]:
