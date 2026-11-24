@@ -23,3 +23,5 @@ __pycache__/
 AGENTS.md
 data/
 docs/
+.evotsad/
+.agent/

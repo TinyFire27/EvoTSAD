@@ -9,6 +9,7 @@ from openai import APIError
 from openai.types.responses import ResponseInputMessageContentListParam
 
 from .agent.core import DefaultAgent, EmptyModelResponseError
+from .evolution.memory import MEMORY_MODES
 from .models import ResponseModel
 from .models.router import resolve_model_config
 from .runtime import SessionStore
@@ -58,9 +59,13 @@ def parse_new_args(arguments: str) -> tuple[str | None, str | None]:
 
 
 def main() -> int:
+    parser = ArgumentParser(description="EvoTSAD terminal chat")
+    parser.add_argument("--memory-mode", choices=MEMORY_MODES, default="all",
+                        help="Memory policy: all successful trials, task improvements, or none (default: all).")
+    options = parser.parse_args()
     load_dotenv(ROOT_PATH / ".env")
     workspace = Path.cwd().resolve()
-    tools = ExperimentToolExecutor(workspace=workspace)
+    tools = ExperimentToolExecutor(workspace=workspace, memory_mode=options.memory_mode)
     terminal = ChatTerminal()
     instructions = build_instructions(workspace)
     agent: DefaultAgent | None = None
@@ -79,6 +84,7 @@ def main() -> int:
         default_thinking = default_config.reasoning
 
     terminal.print_welcome(default_model=default_model, workspace=workspace)
+    terminal.print_info(f"Memory mode: {options.memory_mode}")
     if default_model_error is not None:
         terminal.print_error(f"Configure the default model in config.toml. {default_model_error}")
 

@@ -9,6 +9,8 @@
 
 ## Time-Series Anomaly Detection Toolkit
 
+- `search_memory(query?, limit?)` searches experiences for the selected memory mode in this workspace. Use an empty query for recent experiences. The selected mode determines what is saved; in `none` mode nothing is saved or retrieved. Inspect relevant past pipelines when planning a task, but validate them on the current dataset; scores from different tasks are not directly comparable.
+
 The built-in toolkit provides detectors and preprocessors and handles pipeline training, scoring, and evaluation. Run experiments through the interfaces below. Follow their argument specifications. You can use the tools without knowing how they are implemented.
 
 - `task_init(objective, data, max_trials, primary_metric?, seed?)` starts a new task from the user's requirements. It initializes the workspace task directory `.evotsad/` and writes the objective, data paths, trial budget, primary metric, and random seed to `task.json`. All trials in the task share these settings. On success, the tool returns the task configuration and its paths. Calling it again resets the current task and its existing artifacts.

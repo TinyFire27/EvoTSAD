@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from ..runtime.errors import HarnessExecutionError
+from ..evolution.memory import ExperienceMemory
 from ..runtime.task_state import TaskState
 from . import ToolExecutor
 from .bash import run_bash
@@ -98,19 +99,33 @@ RUN_TRIAL_TOOL = {
     },
 }
 
+SEARCH_MEMORY_TOOL = {
+    "type": "function", "name": "search_memory",
+    "description": "Search successful experiments from previous tasks by keyword; an empty query returns recent experiences.",
+    "strict": False,
+    "parameters": {"type": "object", "properties": {
+        "query": {"type": "string"}, "limit": {"type": "integer"}
+    }, "additionalProperties": False},
+}
+
 
 class ExperimentToolExecutor(ToolExecutor):
     """Bind the shared tools and experiment tools to a single task."""
 
-    def __init__(self, workspace: Path, *, timeout: int = 600) -> None:
+    def __init__(self, workspace: Path, *, timeout: int = 600, memory_mode: str = "all") -> None:
         super().__init__(workspace, timeout=timeout)
         self.timeout = timeout
         self.task_dir = self.workspace / ".evotsad"
         self.task_state: TaskState | None = None  # 一个实验执行器必须绑定一个 task_state
-        self.schemas = [*self.schemas, TASK_INIT_TOOL, LIST_COMPONENTS_TOOL, RUN_TRIAL_TOOL]
+        self.memory = ExperienceMemory(self.workspace, memory_mode)
+        self.schemas = [*self.schemas, TASK_INIT_TOOL, LIST_COMPONENTS_TOOL, RUN_TRIAL_TOOL, SEARCH_MEMORY_TOOL]
         self._handlers["task_init"] = self.task_init
         self._handlers["list_components"] = self.list_components
         self._handlers["run_trial"] = self.run_trial
+        self._handlers["search_memory"] = self.search_memory
+
+    def search_memory(self, *, query: str = "", limit: int = 5) -> dict:
+        return {"mode": self.memory.mode, "experiences": self.memory.search(query, limit)}
 
     def task_init(
         self,
@@ -224,7 +239,10 @@ class ExperimentToolExecutor(ToolExecutor):
         spec = {
             "task": "anomaly_detection",
             "data": data,
-            "estimator": pipeline,
+            "estimator": [
+                {"class": step["class"], "init_params": step.get("params", {})}
+                for step in pipeline
+            ],
             "metrics": state.task["metrics"],
             "seed": state.task["seed"],
         }
@@ -232,8 +250,28 @@ class ExperimentToolExecutor(ToolExecutor):
         with state.prepare_trial() as pending:
             pending.spec_path.write_text(content + "\n", encoding="utf-8")
             metrics = self._evaluate_spec(pending.spec_path, pending.output_dir)
+            previous_best = max(
+                (event for event in state._read_history(pending._history_stream)
+                 if event["status"] == "completed"),
+                key=lambda event: event["metrics"][state.primary_metric], default=None,
+            )
             trial = state.record_trial(pending, metrics, reason=reason)
         best = state.best_experiment or trial
+        memory_warning = None
+        try:
+            should_remember = self.memory.mode == "all" or (
+                self.memory.mode == "improvements" and (previous_best is None or
+                trial["metrics"][state.primary_metric] > previous_best["metrics"][state.primary_metric])
+            )
+            if should_remember:
+                self.memory.remember({
+                "objective": state.task["objective"], "data": state.data,
+                "primary_metric": state.primary_metric, "pipeline": pipeline,
+                "reason": reason, "metrics": trial["metrics"],
+                "timestamp": trial["timestamp"],
+                })
+        except OSError as exc:
+            memory_warning = f"Trial succeeded but experience could not be saved: {exc}"
         return {
             "experiment_id": trial["experiment_id"],
             "status": trial["status"],
@@ -242,6 +280,7 @@ class ExperimentToolExecutor(ToolExecutor):
             "spec_path": trial["spec_path"],
             "output_dir": trial["output_dir"],
             "metrics": trial["metrics"],
+            "memory_warning": memory_warning,
             "best_experiment": {
                 "experiment_id": best["experiment_id"],
                 "trial_number": best["trial_number"],

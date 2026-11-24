@@ -1,4 +1,4 @@
-default_model = "cas/gpt-6-luna"
+default_model = "custom/gpt-6.1-terra"
 
 [providers.openai]
 base_url = "https://api.openai.com/v1"
@@ -20,4 +20,11 @@ base_url = "https://yyt.s-flag.com/v1"
 api_key_env = "CAS_API_KEY"
 
 [providers.cas.models."gpt-6-luna"]
+reasoning = "medium"
+
+[providers.custom]
+base_url = "https://api.v3.cm/v1"
+api_key_env = "CUSTOM_API_KEY"
+
+[providers.custom.models."gpt-6.1-terra"]
 reasoning = "medium"

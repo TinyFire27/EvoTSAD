@@ -14,6 +14,8 @@ The tools accept time-series data in CSV format only.
 
 ## Run and Refine Candidate Pipelines
 
+Before proposing candidates, call `search_memory` to inspect relevant prior experiences. Treat them as suggestions, not evidence of performance on the current dataset.
+
 1. **Propose the first pipeline.** Profile the series with the task objective in mind. Use the characteristics you observe to choose preprocessing steps, a detector, and its parameters.
 2. **Run a trial.** Pass the candidate as the `pipeline` argument to `run_trial`. The tool trains and evaluates the complete pipeline. A short `reason` is recommended to explain why the candidate is worth trying or what you want to test in this trial.
 3. **Choose the next trial.** Review the current trial's metrics and the best trial so far. Consider the candidates you have already evaluated. You can tune a promising detector's core hyperparameters, revise the preprocessing steps, or try another detector family. Base each change on an observed characteristic of the series or a result from a previous trial.
