@@ -30,14 +30,14 @@ The experiment tools automatically manage all task artifacts, including those fr
 └── experiments/                 # Per-trial directories
     └── exp-001/                 # Automatically assigned, unique trial ID
         ├── spec.json            # Configuration used to run this trial
-        └── artifacts/
-            ├── model/model.zip          # Trained detector or pipeline
-            ├── prediction/scores.csv    # Pointwise anomaly scores on the evaluation segment
-            └── evaluation/metrics.json  # Metrics for this trial
+        ├── model.zip            # Trained detector or pipeline
+        ├── scores.csv           # Pointwise anomaly scores on data.eval
+        ├── metrics.json         # Evaluation metrics for this trial
+        └── manifest.json        # Completion time and file names relative to this directory
 ```
 
-To inspect a trial later, use the `spec_path` and `output_dir` returned by the tool.
+The returned `experiment_dir` is the trial directory itself.
 
 ## Stop and Deliver
 
-Stop when you have used the trial budget, reached the target agreed with the user, or received a request to stop. Select the trial with the best primary metric among all evaluated candidates. Use `best_experiment` to report the trial ID, primary metric score, and paths to the experiment configuration and trained model. Briefly explain why you selected that pipeline.
+Stop when you have used the trial budget, reached the target agreed with the user, or received a request to stop. Select the trial with the best primary metric among all evaluated candidates. Report its ID and score from `best_experiment`, link its configuration at `best_experiment.spec_path` and its trained model at `<best_experiment.experiment_dir>/model.zip`, and briefly explain your selection.

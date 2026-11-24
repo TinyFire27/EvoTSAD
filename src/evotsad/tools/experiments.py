@@ -2,11 +2,16 @@
 
 import json
 import shlex
-from pathlib import Path
 from tempfile import TemporaryDirectory
+import fcntl
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from shutil import rmtree
+from typing import Any, TextIO
 
 from ..runtime.errors import HarnessExecutionError
-from ..runtime.task_state import TaskState
 from . import ToolExecutor
 from .bash import run_bash
 
@@ -95,6 +100,131 @@ RUN_TRIAL_TOOL = {
         "additionalProperties": False,
     },
 }
+
+
+@dataclass
+class Trial:
+    """The experiment ID, paths, and spec for a reserved trial."""
+
+    trial_number: int
+    experiment_dir: Path
+    experiment_id: str
+    spec_path: Path
+    spec: dict
+    recorded: bool = field(default=False, init=False)
+
+
+class TaskState:
+    """Open an existing task and reconstruct its state from history.jsonl."""
+
+    def __init__(self, task_dir: Path) -> None:
+        self.task_dir = task_dir.expanduser().resolve()
+        self.task_path = self.task_dir / "task.json"
+        self.history_path = self.task_dir / "history.jsonl"
+        self.experiments_dir = self.task_dir / "experiments"
+
+        self.task = json.loads(self.task_path.read_text(encoding="utf-8"))
+        self.primary_metric: str = self.task["primary_metric"]
+
+    @classmethod
+    def create(cls, task_dir: Path, task: dict[str, Any]) -> "TaskState":
+        """Create a task directory and save the agreed settings once."""
+        metric = task.get("primary_metric")
+        if not isinstance(metric, str) or not metric.strip():
+            raise ValueError("task.primary_metric must name the selection metric.")
+        content = json.dumps(task, ensure_ascii=False, indent=2, allow_nan=False)
+        task_dir = task_dir.expanduser().resolve()
+        task_dir.mkdir(parents=True)
+        (task_dir / "experiments").mkdir()
+        (task_dir / "history.jsonl").touch()
+        (task_dir / "task.json").write_text(content + "\n", encoding="utf-8")
+        return cls(task_dir)
+
+    @property
+    def history(self) -> list[dict[str, Any]]:
+        with self.history_path.open(encoding="utf-8") as stream:
+            fcntl.flock(stream, fcntl.LOCK_SH)
+            return self._read_history(stream)
+
+    @property
+    def recorded_trials(self) -> int:
+        """Count trials with a successful evaluation."""
+        return len(self.history)
+
+    @property
+    def best_experiment(self) -> dict[str, Any] | None:
+        return max(
+            self.history, key=lambda trial: trial["metrics"][self.primary_metric], default=None
+        )
+
+    @contextmanager
+    def create_trial(self, spec) -> Iterator[Trial]:
+        """Reserve an experiment directory and clean it up if the trial is unrecorded."""
+        with self.history_path.open("a+", encoding="utf-8") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            history = self._read_history(stream)
+            trial_number = len(history) + 1
+            max_trials = self.task["max_trials"]
+            if trial_number > max_trials:
+                raise ValueError(f"Trial budget reached ({max_trials}/{max_trials}).")
+
+            number = trial_number
+            experiment_dir = self.experiments_dir / f"exp-{number:03d}"
+            while experiment_dir.exists():
+                number += 1
+                experiment_dir = self.experiments_dir / f"exp-{number:03d}"
+            experiment_dir.mkdir()
+
+            trial = Trial(
+                trial_number=trial_number,
+                spec_path=experiment_dir / "spec.json",
+                experiment_dir=experiment_dir,
+                experiment_id=experiment_dir.name,
+                spec=spec,
+            )
+
+            try:
+                trial.spec_path.write_text(
+                    json.dumps(spec, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+                    encoding="utf-8",
+                )
+                yield trial
+            finally:
+                if not trial.recorded:
+                    rmtree(experiment_dir)
+
+    def record_trial(
+        self, trial: Trial, *, reason: str, metrics: dict[str, float]
+    ) -> dict[str, Any]:
+        """Append a successful trial with the spec used for evaluation."""
+
+        record = {
+            "trial_number": trial.trial_number,
+            "experiment_id": trial.experiment_id,
+            "experiment_dir": str(trial.experiment_dir),
+            "spec_path": str(trial.spec_path),
+            "spec": trial.spec,
+            "reason": reason,
+            "metrics": metrics,
+        }
+
+        with self.history_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+
+        trial.recorded = True
+        return record
+
+    def get_experiment(self, experiment_id: str) -> dict[str, Any]:
+        """Return the latest recorded state of one experiment."""
+        for event in reversed(self.history):
+            if event["experiment_id"] == experiment_id:
+                return event
+        raise ValueError(f"Unknown experiment: {experiment_id}")
+
+    @staticmethod
+    def _read_history(stream: TextIO) -> list[dict[str, Any]]:
+        stream.seek(0)
+        return [json.loads(line) for line in stream if line.strip()]
 
 
 class ExperimentToolExecutor(ToolExecutor):
@@ -216,9 +346,12 @@ class ExperimentToolExecutor(ToolExecutor):
             if step.keys() - {"class", "params"} or not isinstance(params, dict):
                 raise ValueError("Pipeline steps accept a class and an optional params object.")
 
-        data = {"train": state.data["train"], "test": state.data["eval"]}
-        if state.data.get("val") is not None:
-            data["val"] = state.data["val"]
+        task_data = state.task["data"]
+        data = {"train": task_data["train"], "test": task_data["eval"]}
+        if task_data.get("val") is not None:
+            data["val"] = task_data["val"]
+
+        # 构建好实验 spec
         spec = {
             "task": "anomaly_detection",
             "data": data,
@@ -226,38 +359,30 @@ class ExperimentToolExecutor(ToolExecutor):
             "metrics": state.task["metrics"],
             "seed": state.task["seed"],
         }
-        content = json.dumps(spec, ensure_ascii=False, indent=2, allow_nan=False)
-        with state.prepare_trial() as pending:
-            pending.spec_path.write_text(content + "\n", encoding="utf-8")
-            metrics = self._evaluate_spec(pending.spec_path, pending.output_dir)
-            trial = state.record_trial(pending, metrics, reason=reason)
-        best = state.best_experiment or trial
+
+        # with 尝试执行实验，如果失败就清除
+        with state.create_trial(spec) as trial:
+            result = self._libraryts("run", "--spec", str(trial.spec_path), "--output-dir", str(trial.experiment_dir))
+            metrics = result["metrics"]
+            record = state.record_trial(trial, reason=reason, metrics=metrics)  # 预算 - 1
+
+        best = state.best_experiment or record
         return {
-            "experiment_id": trial["experiment_id"],
-            "status": trial["status"],
-            "timestamp": trial["timestamp"],
-            "progress": f"{trial['trial_number']:02d}/{state.task['max_trials']}",
-            "spec_path": trial["spec_path"],
-            "output_dir": trial["output_dir"],
-            "metrics": trial["metrics"],
+            "status": "completed",
+            "trial_number": trial.trial_number,
+            "experiment_id": trial.experiment_id,
+            "experiment_dir": str(trial.experiment_dir),
+            "spec_path": str(trial.spec_path),
+            "metrics": metrics,
+            "progress": f"{record['trial_number']:02d}/{state.task['max_trials']}",
             "best_experiment": {
-                "experiment_id": best["experiment_id"],
                 "trial_number": best["trial_number"],
+                "experiment_id": best["experiment_id"],
+                "experiment_dir": best["experiment_dir"],
                 "spec_path": best["spec_path"],
-                "output_dir": best["output_dir"],
-                "metrics": best["metrics"],
-                "timestamp": best["timestamp"],
+                "metrics": best["metrics"]
             },
         }
-
-    def _evaluate_spec(self, spec_path: Path, output_dir: Path) -> dict[str, float]:
-        result = self._libraryts("run", "--spec", str(spec_path), "--output-dir", str(output_dir))
-        metrics = result.get("metrics") if isinstance(result, dict) else None
-        if not isinstance(metrics, dict):
-            raise HarnessExecutionError(
-                "LibraryTS returned no evaluation metrics after a successful run."
-            )
-        return metrics
 
     def _libraryts(self, *args: str) -> dict | list:
         result = run_bash(
