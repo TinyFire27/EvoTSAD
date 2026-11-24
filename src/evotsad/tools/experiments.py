@@ -6,6 +6,13 @@ import os
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import fcntl
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from shutil import rmtree
+from typing import Any, TextIO
 
 from ..runtime.errors import HarnessExecutionError
 from ..evolution.memory import ExperienceMemory
@@ -233,9 +240,12 @@ class ExperimentToolExecutor(ToolExecutor):
             if step.keys() - {"class", "params"} or not isinstance(params, dict):
                 raise ValueError("Pipeline steps accept a class and an optional params object.")
 
-        data = {"train": state.data["train"], "test": state.data["eval"]}
-        if state.data.get("val") is not None:
-            data["val"] = state.data["val"]
+        task_data = state.task["data"]
+        data = {"train": task_data["train"], "test": task_data["eval"]}
+        if task_data.get("val") is not None:
+            data["val"] = task_data["val"]
+
+        # 构建好实验 spec
         spec = {
             "task": "anomaly_detection",
             "data": data,
@@ -282,23 +292,13 @@ class ExperimentToolExecutor(ToolExecutor):
             "metrics": trial["metrics"],
             "memory_warning": memory_warning,
             "best_experiment": {
-                "experiment_id": best["experiment_id"],
                 "trial_number": best["trial_number"],
+                "experiment_id": best["experiment_id"],
+                "experiment_dir": best["experiment_dir"],
                 "spec_path": best["spec_path"],
-                "output_dir": best["output_dir"],
-                "metrics": best["metrics"],
-                "timestamp": best["timestamp"],
+                "metrics": best["metrics"]
             },
         }
-
-    def _evaluate_spec(self, spec_path: Path, output_dir: Path) -> dict[str, float]:
-        result = self._libraryts("run", "--spec", str(spec_path), "--output-dir", str(output_dir))
-        metrics = result.get("metrics") if isinstance(result, dict) else None
-        if not isinstance(metrics, dict):
-            raise HarnessExecutionError(
-                "LibraryTS returned no evaluation metrics after a successful run."
-            )
-        return metrics
 
     def _libraryts(self, *args: str) -> dict | list:
         result = run_bash(
