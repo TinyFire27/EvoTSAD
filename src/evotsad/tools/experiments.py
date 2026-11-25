@@ -1,5 +1,6 @@
 """Tools available to the EvoTSAD experiment agent."""
 
+import csv
 import json
 import shlex
 from tempfile import TemporaryDirectory
@@ -12,14 +13,17 @@ from shutil import rmtree
 from typing import Any, TextIO
 
 from ..runtime.errors import HarnessExecutionError
-from . import ToolExecutor
+from . import ToolExecutor, function_tool
 from .bash import run_bash
+
+
+BASELINE_DETECTORS = ("SubLOF", "SubOCSVM", "SubPCA", "IForest", "HBOS")
 
 
 TASK_INIT_TOOL = {
     "type": "function",
     "name": "task_init",
-    "description": "Initialize a task, replacing the previous task directory and its outputs.",
+    "description": "Initialize a task, replacing its previous outputs. Evaluate five fixed detectors with default parameters and return their metrics separately from the trial budget.",
     "strict": False,
     "parameters": {
         "type": "object",
@@ -28,14 +32,14 @@ TASK_INIT_TOOL = {
             "data": {
                 "type": "object",
                 "properties": {
-                    "train": {"type": "string", "description": "Training CSV path."},
+                    "train": {"type": "string", "description": "Training CSV with a value column. Optional columns: timestamp, label."},
                     "val": {
                         "type": ["string", "null"],
-                        "description": "Optional training validation CSV for early stopping.",
+                        "description": "Optional early-stopping CSV with the same column rules as train.",
                     },
                     "eval": {
                         "type": "string",
-                        "description": "Labeled CSV for evaluating trials during iteration.",
+                        "description": "Evaluation CSV with value and label columns, and an optional timestamp.",
                     },
                 },
                 "required": ["train", "eval"],
@@ -101,6 +105,18 @@ RUN_TRIAL_TOOL = {
     },
 }
 
+GET_HISTORY_TOOL = function_tool(
+    "get_history", "Return the active task's successful trial records in trial_history, in recorded order.",
+)
+GET_EXPERIMENT_TOOL = function_tool(
+    "get_experiment", "Return one full record from the active task in experiment, by its exact ID.",
+    experiment_id="Exact experiment ID, for example exp-001.",
+)
+GET_BEST_EXPERIMENT_TOOL = function_tool(
+    "get_best_experiment",
+    "Return the active task's highest-scoring record in best_experiment. The field is null before the first successful trial.",
+)
+
 
 @dataclass
 class Trial:
@@ -120,25 +136,39 @@ class TaskState:
     def __init__(self, task_dir: Path) -> None:
         self.task_dir = task_dir.expanduser().resolve()
         self.task_path = self.task_dir / "task.json"
+        self.baselines_path = self.task_dir / "baselines.json"
+        self.profile_path = self.task_dir / "profile.json"
         self.history_path = self.task_dir / "history.jsonl"
         self.experiments_dir = self.task_dir / "experiments"
 
         self.task = json.loads(self.task_path.read_text(encoding="utf-8"))
+        self.data = self.task["data"]
         self.primary_metric: str = self.task["primary_metric"]
 
     @classmethod
     def create(cls, task_dir: Path, task: dict[str, Any]) -> "TaskState":
         """Create a task directory and save the agreed settings once."""
-        metric = task.get("primary_metric")
-        if not isinstance(metric, str) or not metric.strip():
-            raise ValueError("task.primary_metric must name the selection metric.")
         content = json.dumps(task, ensure_ascii=False, indent=2, allow_nan=False)
-        task_dir = task_dir.expanduser().resolve()
+        task_dir = task_dir.expanduser()
         task_dir.mkdir(parents=True)
         (task_dir / "experiments").mkdir()
         (task_dir / "history.jsonl").touch()
         (task_dir / "task.json").write_text(content + "\n", encoding="utf-8")
         return cls(task_dir)
+
+    def experiment_spec(self, pipeline: list[dict]) -> dict:
+        """Build the LibraryTS spec shared by baselines and budgeted trials."""
+        return {
+            "task": "anomaly_detection",
+            "data": {
+                "train": self.data["train"],
+                "val": self.data.get("val"),
+                "test": self.data["eval"],
+            },
+            "estimator": pipeline,
+            "metrics": self.task["metrics"],
+            "seed": self.task["seed"],
+        }
 
     @property
     def history(self) -> list[dict[str, Any]]:
@@ -235,10 +265,16 @@ class ExperimentToolExecutor(ToolExecutor):
         self.timeout = timeout
         self.task_dir = self.workspace / ".evotsad"
         self.task_state: TaskState | None = None  # 一个实验执行器必须绑定一个 task_state
-        self.schemas = [*self.schemas, TASK_INIT_TOOL, LIST_COMPONENTS_TOOL, RUN_TRIAL_TOOL]
+        self.schemas = [
+            *self.schemas, TASK_INIT_TOOL, LIST_COMPONENTS_TOOL, RUN_TRIAL_TOOL,
+            GET_HISTORY_TOOL, GET_EXPERIMENT_TOOL, GET_BEST_EXPERIMENT_TOOL,
+        ]
         self._handlers["task_init"] = self.task_init
         self._handlers["list_components"] = self.list_components
         self._handlers["run_trial"] = self.run_trial
+        self._handlers["get_history"] = self.get_history
+        self._handlers["get_experiment"] = self.get_experiment
+        self._handlers["get_best_experiment"] = self.get_best_experiment
 
     def task_init(
         self,
@@ -257,22 +293,40 @@ class ExperimentToolExecutor(ToolExecutor):
         if seed is not None and type(seed) is not int:
             raise ValueError("seed must be an integer.")
 
+        # 数据格式检查
         paths = {}
         for split in ("train", "val", "eval"):
-            value = data.get(split)
-            if split == "val" and value is None:
+            # 1. 解析 CSV 路径。train 和 eval 必填，val 可省略。
+            raw_path = data.get(split)
+            if split == "val" and raw_path is None:
                 paths[split] = None
                 continue
-            if not isinstance(value, str) or not value.strip():
+            if not raw_path:
                 raise ValueError(f"data.{split} must be a CSV path.")
-            path = (self.workspace / Path(value).expanduser()).resolve()
-            if path.suffix.lower() != ".csv" or not path.is_file():
-                raise ValueError(f"data.{split} must point to an existing CSV file: {path}")
+            path = (self.workspace / Path(raw_path).expanduser()).resolve()
+            if path.suffix.lower() != ".csv":
+                raise ValueError(f"data.{split} must be a .csv file: {path}")
             paths[split] = str(path)
+
+            # 2. 核对表头。每段都需要 value，只有 eval 强制要求 label。
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                columns = next(csv.reader(stream), [])
+            expected = ["value"]
+            if split == "eval" or "label" in columns:
+                expected.append("label")
+            if "timestamp" in columns:
+                expected.append("timestamp")
+            if sorted(columns) != sorted(expected):
+                raise ValueError(f"data.{split} expects columns {expected}, got {columns}: {path}")
+
+        # 3. 确认训练和评估使用不同文件。
         if paths["train"] == paths["eval"]:
             raise ValueError("data.train and data.eval must be different files.")
 
         metric = "VUS-PR" if primary_metric is None else primary_metric.strip()
+        if not metric:
+            raise ValueError("task.primary_metric must name the selection metric.")
+        
         task = {
             "objective": objective.strip(),
             "data": paths,
@@ -281,39 +335,53 @@ class ExperimentToolExecutor(ToolExecutor):
             "metrics": {metric: {}},
             "seed": 2026 if seed is None else seed,
         }
-        if self.task_dir.is_symlink():
-            raise ValueError("The task directory must not be a symbolic link.")
-        task_dir = self.task_dir.resolve()
-        if task_dir.exists():
-            if not (
-                (task_dir / "task.json").is_file()
-                and (task_dir / "history.jsonl").is_file()
-                and (task_dir / "experiments").is_dir()
-            ):
-                raise ValueError(f"Refusing to replace an existing non-task directory: {task_dir}")
-            if any(path and Path(path).is_relative_to(task_dir) for path in paths.values()):
-                raise ValueError("Place input CSV files outside the task directory before replacing it.")
-            with TemporaryDirectory(dir=task_dir.parent) as directory:
-                staging = Path(directory)
-                prepared = TaskState.create(staging / "new", task)
-                previous = staging / "previous"
-                task_dir.rename(previous)
-                try:
-                    prepared.task_dir.rename(task_dir)
-                except OSError:
-                    previous.rename(task_dir)
-                    raise
-            self.task_state = TaskState(task_dir)
-        else:
-            self.task_state = TaskState.create(task_dir, task)
+
+        # 初始化任务目录和任务状态
+        self.task_state = None
+        if self.task_dir.exists():
+            rmtree(self.task_dir)
+        state = TaskState.create(self.task_dir, task)
+
+        # 评测 baselines
+        baselines = self._baselines(state)
+        n_success = sum(result["error"] is None for result in baselines.values())
+        state.baselines_path.write_text(
+            json.dumps(baselines, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        self.task_state = state
         return {
-            "status": "Task initialized successfully.",
-            "task_dir": str(self.task_state.task_dir),
-            "task_path": str(self.task_state.task_path),
-            "history_path": str(self.task_state.history_path),
-            "experiments_dir": str(self.task_state.experiments_dir),
-            "task": self.task_state.task,
+            "status": (
+                f"Task initialized. Automatically evaluated {len(baselines)} baseline detectors "
+                f"using their default parameters ({n_success} succeeded)."
+            ),
+            "task_dir": str(state.task_dir),
+            "task_path": str(state.task_path),
+            "baselines_path": str(state.baselines_path),
+            "history_path": str(state.history_path),
+            "experiments_dir": str(state.experiments_dir),
+            "task": state.task,
+            "baselines": baselines,
         }
+
+    def _baselines(self, state: TaskState) -> dict:
+        """Keep reference scores only; a detector failure is reported by name."""
+        results = {}
+        for name in BASELINE_DETECTORS:
+            spec = state.experiment_spec([{"class": name}])
+            with TemporaryDirectory(dir=state.task_dir) as directory:
+                work_dir = Path(directory)
+                spec_path = work_dir / "spec.json"
+                spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+                try:
+                    result = self._libraryts(
+                        "run", "--spec", str(spec_path), "--output-dir", str(work_dir / "output")
+                    )
+                except RuntimeError as exc:
+                    results[name] = {"params": "default", "metrics": None, "error": str(exc)}
+                else:
+                    results[name] = {"params": "default","metrics": result["metrics"], "error": None}
+        return results
 
     def list_components(self, *, kind: str, name: str | None = None) -> dict:
         """Discover available detector and preprocessor classes."""
@@ -335,7 +403,7 @@ class ExperimentToolExecutor(ToolExecutor):
         """Evaluate a candidate pipeline using the initialized task settings."""
         state = self.task_state
         if state is None:
-            raise ValueError("Call task_init before running a trial.")
+            raise ValueError("No active task. Call task_init before running a trial.")
         if not isinstance(pipeline, list) or not pipeline:
             raise ValueError("pipeline must be a non-empty list of steps.")
         for step in pipeline:
@@ -346,19 +414,7 @@ class ExperimentToolExecutor(ToolExecutor):
             if step.keys() - {"class", "params"} or not isinstance(params, dict):
                 raise ValueError("Pipeline steps accept a class and an optional params object.")
 
-        task_data = state.task["data"]
-        data = {"train": task_data["train"], "test": task_data["eval"]}
-        if task_data.get("val") is not None:
-            data["val"] = task_data["val"]
-
-        # 构建好实验 spec
-        spec = {
-            "task": "anomaly_detection",
-            "data": data,
-            "estimator": pipeline,
-            "metrics": state.task["metrics"],
-            "seed": state.task["seed"],
-        }
+        spec = state.experiment_spec(pipeline)
 
         # with 尝试执行实验，如果失败就清除
         with state.create_trial(spec) as trial:
@@ -382,6 +438,32 @@ class ExperimentToolExecutor(ToolExecutor):
                 "spec_path": best["spec_path"],
                 "metrics": best["metrics"]
             },
+        }
+
+    def get_history(self) -> dict[str, Any]:
+        if self.task_state is None:
+            raise ValueError("No active task.")
+        history = self.task_state.history
+        return {
+            "status": "Retrieved the trial history." if history else "No successful trials yet.",
+            "trial_history": history,
+        }
+
+    def get_experiment(self, experiment_id: str) -> dict[str, Any]:
+        if self.task_state is None:
+            raise ValueError("No active task.")
+        return {
+            "status": f"Retrieved experiment {experiment_id}.",
+            "experiment": self.task_state.get_experiment(experiment_id),
+        }
+
+    def get_best_experiment(self) -> dict[str, Any]:
+        if self.task_state is None:
+            raise ValueError("No active task.")
+        best = self.task_state.best_experiment
+        return {
+            "status": "Retrieved the best experiment." if best is not None else "No successful trials yet.",
+            "best_experiment": best,
         }
 
     def _libraryts(self, *args: str) -> dict | list:
