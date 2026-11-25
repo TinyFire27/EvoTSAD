@@ -61,11 +61,14 @@ def parse_new_args(arguments: str) -> tuple[str | None, str | None]:
 def main() -> int:
     parser = ArgumentParser(description="EvoTSAD terminal chat")
     parser.add_argument("--memory-mode", choices=MEMORY_MODES, default="all",
-                        help="Memory policy: all successful trials, task improvements, or none (default: all).")
+                        help="Task-end memory policy: all, improvements, case_bank, contrastive, or none (default: all).")
+    parser.add_argument("--no-update-memory", dest="update_memory", action="store_false",
+                        help="Read the selected memory mode but do not append new memories.")
+    parser.set_defaults(update_memory=True)
     options = parser.parse_args()
     load_dotenv(ROOT_PATH / ".env")
     workspace = Path.cwd().resolve()
-    tools = ExperimentToolExecutor(workspace=workspace, memory_mode=options.memory_mode)
+    tools = ExperimentToolExecutor(workspace=workspace, memory_mode=options.memory_mode, update_memory=options.update_memory)
     terminal = ChatTerminal()
     instructions = build_instructions(workspace)
     agent: DefaultAgent | None = None
@@ -85,6 +88,7 @@ def main() -> int:
 
     terminal.print_welcome(default_model=default_model, workspace=workspace)
     terminal.print_info(f"Memory mode: {options.memory_mode}")
+    terminal.print_info(f"Memory updates: {'on' if options.update_memory else 'off'}")
     if default_model_error is not None:
         terminal.print_error(f"Configure the default model in config.toml. {default_model_error}")
 

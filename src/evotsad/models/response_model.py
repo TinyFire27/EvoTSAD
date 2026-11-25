@@ -27,9 +27,12 @@ class ResponseModel:
         instructions: str,
         tools: list[dict],
         allow_tools: bool,
+        max_output_tokens: int | None = None,
     ) -> Response:
         option_params = {
-            "max_output_tokens": self.config.max_tokens,
+            "max_output_tokens": (min(max_output_tokens, self.config.max_tokens)
+                                  if max_output_tokens is not None and self.config.max_tokens is not None
+                                  else max_output_tokens if max_output_tokens is not None else self.config.max_tokens),
             "temperature": self.config.temperature,
             "top_p": self.config.top_p,
             "reasoning": (

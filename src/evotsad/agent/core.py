@@ -26,6 +26,8 @@ class DefaultAgent:
         self.instructions = instructions
         self.session = session
         self.tools = tools
+        if hasattr(tools, "set_reflection_model"):
+            tools.set_reflection_model(backbone)
 
         self.messages = session.load_session()
 
@@ -33,6 +35,10 @@ class DefaultAgent:
         self, user_input: str | ResponseInputMessageContentListParam
     ) -> str:
         """Continue the conversation until the model returns a final reply."""
+        if hasattr(self.tools, "note_user_input"):
+            text = user_input if isinstance(user_input, str) else "\n".join(
+                item["text"] for item in user_input if item.get("type") == "input_text")
+            self.tools.note_user_input(text)
         user_item = {"role": "user", "content": deepcopy(user_input)}
         self.session.write(user_item)
         self.messages.append(user_item)

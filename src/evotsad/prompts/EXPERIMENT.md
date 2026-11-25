@@ -2,7 +2,7 @@
 
 ## Initialize the Task
 
-Confirm the user's objective, the data paths, and the maximum number of trials. Once you have this information, call `task_init` once for the new task to initialize the task directory `.evotsad/` and its files. Calling it again clears and rebuilds the directory. Use it again only to start a new task or reset the current one.
+Confirm the user's objective, the data paths, and the maximum number of trials. Once you have this information, call `task_init` once for the new task to initialize the task directory `.evotsad/` and its files. Pass task_description containing the full user request, amendments and agreed constraints, not a short summary. Finish the current task before starting another; starting another task replaces its working directory. Keep input CSV contents unchanged throughout a task.
 
 ### Data Requirements
 
@@ -14,7 +14,7 @@ The tools accept time-series data in CSV format only.
 
 ## Run and Refine Candidate Pipelines
 
-Before proposing candidates, call `search_memory` to inspect relevant prior experiences. Treat them as suggestions, not evidence of performance on the current dataset.
+task_init returns a training profile with 17 fields and initial memories from the selected mode. Before proposing candidates, inspect these experiences and use `search_memory` for a more specific query if needed. Treat them as suggestions, not evidence of performance on the current dataset.
 
 1. **Propose the first pipeline.** Profile the series with the task objective in mind. Use the characteristics you observe to choose preprocessing steps, a detector, and its parameters.
 2. **Run a trial.** Pass the candidate as the `pipeline` argument to `run_trial`. The tool trains and evaluates the complete pipeline. A short `reason` is recommended to explain why the candidate is worth trying or what you want to test in this trial.
@@ -29,17 +29,19 @@ The experiment tools automatically manage all task artifacts, including those fr
 .evotsad/
 ├── task.json                    # Configuration shared by all trials
 ├── history.jsonl                # Rationale, metrics, and artifact paths for each successful trial
+├── attempts.jsonl               # Local successful and failed attempts; not cross-task memory
 └── experiments/                 # Per-trial directories
     └── exp-001/                 # Automatically assigned, unique trial ID
         ├── spec.json            # Configuration used to run this trial
-        ├── model.zip            # Trained detector or pipeline
-        ├── scores.csv           # Pointwise anomaly scores on data.eval
-        ├── metrics.json         # Evaluation metrics for this trial
-        └── manifest.json        # Completion time and file names relative to this directory
+        └── artifacts/           # LibraryTS output_dir: model, scores and evaluation outputs
 ```
 
-The returned `experiment_dir` is the trial directory itself.
+Use the returned `spec_path` and `output_dir` to inspect actual experiment artifacts; do not infer artifact paths from an experiment identifier.
 
 ## Stop and Deliver
 
-Stop when you have used the trial budget, reached the target agreed with the user, or received a request to stop. Select the trial with the best primary metric among all evaluated candidates. Report its ID and score from `best_experiment`, link its configuration at `best_experiment.spec_path` and its trained model at `<best_experiment.experiment_dir>/model.zip`, and briefly explain your selection.
+When the trial budget is exhausted the task ends automatically. If the goal is reached early or the user asks to stop, call `finish_task(reason)` before the final answer. A single trial completing is not task completion. After finish_task no further trials are allowed for that task.
+
+Memory is written only once the entire task ends. During trials it is read-only; current attempts stay in the task log. The modes all, improvements, case_bank and contrastive have separate stores; none never reads or writes cross-task memory. Never use bash or file tools to inspect another mode's memory. Do not use task names or filenames as evidence of dataset properties.
+
+Select the best evaluated trial on the primary metric and report its score and returned artifact paths. Report any memory or reflection warning honestly. Contrastive commentary is an unverified, conditional suggestion; computed differences and embedded before/after experiments are the evidence. Different-task scores are not directly comparable.
