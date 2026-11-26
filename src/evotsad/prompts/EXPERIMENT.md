@@ -14,9 +14,9 @@ The tools accept time-series data in CSV format only.
 
 ## Run and Refine Candidate Pipelines
 
-task_init returns a training profile with 17 fields and initial memories from the selected mode. Before proposing candidates, inspect these experiences and use `search_memory` for a more specific query if needed. Treat them as suggestions, not evidence of performance on the current dataset.
+task_init writes `.evotsad/profile.json` with the training-only 17-field profile, `length`, `missing_ratio`, `observations`, and five baseline results. Windowed detectors receive a data-length-aware `win_len`; other parameters use their defaults unless recorded otherwise. It also returns these baselines and initial memories from the selected mode. Baselines are evaluated on `data.eval` outside the trial budget. Before proposing candidates, inspect the profile and memories; use `search_memory` for a more specific query if needed. Prior-task memories are suggestions, not evidence of performance on the current dataset. Use `edit_file` to refine the observations in `profile.json` as new evidence emerges.
 
-1. **Propose the first pipeline.** Profile the series with the task objective in mind. Use the characteristics you observe to choose preprocessing steps, a detector, and its parameters.
+1. **Propose the first pipeline.** Use the training profile, baseline metrics, and task objective to choose preprocessing steps, a detector, and its parameters. Explain the trial's purpose in `reason`.
 2. **Run a trial.** Pass the candidate as the `pipeline` argument to `run_trial`. The tool trains and evaluates the complete pipeline. A short `reason` is recommended to explain why the candidate is worth trying or what you want to test in this trial.
 3. **Choose the next trial.** Review the current trial's metrics and the best trial so far. Consider the candidates you have already evaluated. You can tune a promising detector's core hyperparameters, revise the preprocessing steps, or try another detector family. Base each change on an observed characteristic of the series or a result from a previous trial.
 4. **Handle failures.** If a tool returns a correctable error, use the error message to revise the candidate and resubmit it under the same task. Only successful evaluations count against the trial budget.
@@ -28,15 +28,19 @@ The experiment tools automatically manage all task artifacts, including those fr
 ```text
 .evotsad/
 ├── task.json                    # Configuration shared by all trials
+├── profile.json                 # Training profile, observations, and baseline scores/errors
 ├── history.jsonl                # Rationale, metrics, and artifact paths for each successful trial
 ├── attempts.jsonl               # Local successful and failed attempts; not cross-task memory
 └── experiments/                 # Per-trial directories
     └── exp-001/                 # Automatically assigned, unique trial ID
         ├── spec.json            # Configuration used to run this trial
-        └── artifacts/           # LibraryTS output_dir: model, scores and evaluation outputs
+        ├── model.zip            # Trained pipeline
+        ├── scores.csv           # Evaluation scores
+        ├── metrics.json         # Evaluation metrics
+        └── manifest.json        # Artifact manifest
 ```
 
-Use the returned `spec_path` and `output_dir` to inspect actual experiment artifacts; do not infer artifact paths from an experiment identifier.
+Use `get_history()` to compare successful candidates, `get_experiment(experiment_id)` for a full record, and `get_best_experiment()` for the current leader. The returned `experiment_dir` contains the trial artifacts. Baselines are reference scores, not successful trials, and cannot become `best_experiment` without a budgeted trial.
 
 ## Stop and Deliver
 

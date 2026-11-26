@@ -109,13 +109,17 @@ $env:PYTHONPATH = "src"
 
 ```text
 .evotsad/
-├── task.json              # 任务配置和 17 字段画像
+├── task.json              # 任务配置和画像快照
+├── profile.json           # 17 字段画像、观察记录及五个基线结果
 ├── history.jsonl          # 成功试验记录
 ├── attempts.jsonl         # 成功和失败尝试记录
 └── experiments/
     └── exp-001/
         ├── spec.json      # LibraryTS 实验配置
-        └── artifacts/     # 模型、预测和评估结果
+        ├── model.zip      # 训练后的模型
+        ├── scores.csv     # 评估数据的异常分数
+        ├── metrics.json   # 评估指标
+        └── manifest.json  # 产物清单
 ```
 
-试验结果中的 `spec_path` 和 `output_dir` 是查看实际产物的可靠路径。不同任务的指标不能直接比较，应结合当前数据和任务目标解释历史经验。
+试验结果中的 `spec_path` 和 `experiment_dir` 是查看实际产物的可靠路径。五个基线仅作参考，不占试验预算，也不参与最佳试验排名。不同任务的指标不能直接比较，应结合当前数据和任务目标解释历史经验。

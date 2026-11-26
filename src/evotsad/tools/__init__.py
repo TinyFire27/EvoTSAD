@@ -10,7 +10,7 @@ from openai.types.responses import ResponseFunctionCallOutputItemListParam
 
 from ..runtime.errors import HarnessExecutionError
 from .bash import run_bash
-from .files import read_file, read_image, write_file
+from .files import edit_file, read_file, read_image, write_file
 
 
 def function_tool(name: str, description: str, **properties: str) -> dict:
@@ -49,9 +49,16 @@ TOOLS = [
     ),
     function_tool(
         "write_file",
-        "Create a UTF-8 text file in the current workspace. Use a new path for a revision.",
+        "Create a new UTF-8 text file in the current workspace.",
         path="A new path in the workspace.",
         content="Text to write.",
+    ),
+    function_tool(
+        "edit_file",
+        "Replace one exact text match in an existing UTF-8 file in the workspace.",
+        path="An existing file path in the workspace.",
+        old_text="Nonempty text that appears exactly once, including whitespace.",
+        new_text="Replacement text. Use an empty string to delete the match.",
     ),
 ]
 
@@ -70,6 +77,7 @@ class ToolExecutor:
             "read_file": partial(read_file, cwd=self.workspace),
             "read_image": partial(read_image, cwd=self.workspace),
             "write_file": partial(write_file, cwd=self.workspace),
+            "edit_file": partial(edit_file, cwd=self.workspace),
         }
 
     def execute(

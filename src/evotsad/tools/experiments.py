@@ -4,22 +4,32 @@ import json
 import shlex
 import os
 import subprocess
+import csv
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from shutil import copy2, rmtree
 from tempfile import TemporaryDirectory
 from copy import deepcopy
 from datetime import datetime, timezone
 from time import perf_counter
 import platform
 from importlib.metadata import version, PackageNotFoundError
+from typing import Any, TextIO
+from math import isfinite
 
 from ..runtime.data_profile import training_profile
 from ..evolution.contrastive import model_reflector
 
 from ..runtime.errors import HarnessExecutionError
+from ..runtime.file_lock import locked
 from ..evolution.memory import ExperienceMemory
-from ..runtime.task_state import TaskState
-from . import ToolExecutor
+from . import ToolExecutor, function_tool
 from .bash import run_bash
+
+
+BASELINE_DETECTORS = ("SubLOF", "SubOCSVM", "SubPCA", "IForest", "HBOS")
 
 
 TASK_INIT_TOOL = {
@@ -126,6 +136,146 @@ FINISH_TASK_TOOL = {
 }
 
 
+GET_HISTORY_TOOL = function_tool(
+    "get_history", "Return the active task's successful trial records in trial_history, in recorded order.",
+)
+GET_EXPERIMENT_TOOL = function_tool(
+    "get_experiment", "Return one full record from the active task in experiment, by its exact ID.",
+    experiment_id="Exact experiment ID, for example exp-001.",
+)
+GET_BEST_EXPERIMENT_TOOL = function_tool(
+    "get_best_experiment", "Return the active task's highest-scoring record in best_experiment.",
+)
+
+
+@dataclass
+class Trial:
+    trial_number: int
+    experiment_dir: Path
+    spec_path: Path
+    spec: dict
+    history_stream: TextIO
+    recorded: bool = field(default=False, init=False)
+
+    @property
+    def experiment_id(self) -> str:
+        return self.experiment_dir.name
+
+
+class TaskState:
+    """Persist task settings and successful trials in a flat artifact layout."""
+
+    def __init__(self, task_dir: Path) -> None:
+        self.task_dir = task_dir.expanduser().resolve()
+        self.task_path = self.task_dir / "task.json"
+        self.profile_path = self.task_dir / "profile.json"
+        self.history_path = self.task_dir / "history.jsonl"
+        self.experiments_dir = self.task_dir / "experiments"
+        self.task = json.loads(self.task_path.read_text(encoding="utf-8"))
+        self.primary_metric: str = self.task["primary_metric"]
+
+    @classmethod
+    def create(cls, task_dir: Path, task: dict[str, Any]) -> "TaskState":
+        if not isinstance(task.get("primary_metric"), str) or not task["primary_metric"].strip():
+            raise ValueError("task.primary_metric must name the selection metric.")
+        task_dir = task_dir.expanduser().resolve()
+        task_dir.mkdir(parents=True)
+        (task_dir / "experiments").mkdir()
+        (task_dir / "history.jsonl").touch()
+        (task_dir / "task.json").write_text(
+            json.dumps(task, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+        )
+        return cls(task_dir)
+
+    def experiment_spec(self, pipeline: list[dict]) -> dict:
+        data = self.task["data"]
+        spec_data = {"train": data["train"], "test": data["eval"]}
+        if data.get("val") is not None:
+            spec_data["val"] = data["val"]
+        return {
+            "task": "anomaly_detection",
+            "data": spec_data,
+            "estimator": [
+                {"class": step["class"], "init_params": step.get("params", {})} for step in pipeline
+            ],
+            "metrics": self.task["metrics"],
+            "seed": self.task["seed"],
+        }
+
+    @property
+    def history(self) -> list[dict[str, Any]]:
+        with self.history_path.open("a+", encoding="utf-8") as stream:
+            with locked(stream, shared=True):
+                return self._read_history(stream)
+
+    @property
+    def recorded_trials(self) -> int:
+        return len(self.history)
+
+    @property
+    def best_experiment(self) -> dict[str, Any] | None:
+        return max(self.history, key=lambda trial: trial["metrics"][self.primary_metric], default=None)
+
+    @contextmanager
+    def create_trial(self, spec: dict) -> Iterator[Trial]:
+        with self.history_path.open("a+", encoding="utf-8") as stream:
+            with locked(stream):
+                trial_number = len(self._read_history(stream)) + 1
+                max_trials = self.task["max_trials"]
+                if trial_number > max_trials:
+                    raise ValueError(f"Trial budget reached ({max_trials}/{max_trials}).")
+                number = trial_number
+                experiment_dir = self.experiments_dir / f"exp-{number:03d}"
+                while experiment_dir.exists():
+                    number += 1
+                    experiment_dir = self.experiments_dir / f"exp-{number:03d}"
+                experiment_dir.mkdir()
+                trial = Trial(trial_number, experiment_dir, experiment_dir / "spec.json", spec, stream)
+                try:
+                    trial.spec_path.write_text(
+                        json.dumps(spec, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+                        encoding="utf-8",
+                    )
+                    yield trial
+                finally:
+                    if not trial.recorded:
+                        rmtree(experiment_dir)
+
+    def record_trial(self, trial: Trial, *, reason: str, metrics: dict[str, float]) -> dict[str, Any]:
+        if trial.recorded or trial.history_stream.closed:
+            raise HarnessExecutionError("The trial is no longer pending.")
+        score = metrics.get(self.primary_metric)
+        if type(score) not in (int, float) or not isfinite(score):
+            raise HarnessExecutionError(f"Expected a finite {self.primary_metric} score.")
+        record = {
+            "trial_number": trial.trial_number,
+            "experiment_id": trial.experiment_id,
+            "experiment_dir": str(trial.experiment_dir),
+            "spec_path": str(trial.spec_path),
+            "spec": trial.spec,
+            "status": "completed",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+            "metrics": metrics,
+        }
+        trial.history_stream.seek(0, 2)
+        trial.history_stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+        trial.history_stream.flush()
+        trial.recorded = True
+        return record
+
+    def get_experiment(self, experiment_id: str) -> dict[str, Any]:
+        for record in reversed(self.history):
+            if record["experiment_id"] == experiment_id:
+                return record
+        raise ValueError(f"Unknown experiment: {experiment_id}")
+
+    @staticmethod
+    def _read_history(stream: TextIO) -> list[dict[str, Any]]:
+        stream.seek(0)
+        return [json.loads(line) for line in stream if line.strip()]
+
+
 class ExperimentToolExecutor(ToolExecutor):
     """Bind the shared tools and experiment tools to a single task."""
 
@@ -140,12 +290,19 @@ class ExperimentToolExecutor(ToolExecutor):
         self.attempts = []
         self.pending_user_text = []
         self.finish_result = None
-        self.schemas = [*self.schemas, TASK_INIT_TOOL, LIST_COMPONENTS_TOOL, RUN_TRIAL_TOOL, SEARCH_MEMORY_TOOL, FINISH_TASK_TOOL]
+        self.schemas = [
+            *self.schemas, TASK_INIT_TOOL, LIST_COMPONENTS_TOOL, RUN_TRIAL_TOOL,
+            SEARCH_MEMORY_TOOL, FINISH_TASK_TOOL,
+            GET_HISTORY_TOOL, GET_EXPERIMENT_TOOL, GET_BEST_EXPERIMENT_TOOL,
+        ]
         self._handlers["task_init"] = self.task_init
         self._handlers["list_components"] = self.list_components
         self._handlers["run_trial"] = self.run_trial
         self._handlers["search_memory"] = self.search_memory
         self._handlers["finish_task"] = self.finish_task
+        self._handlers["get_history"] = self.get_history
+        self._handlers["get_experiment"] = self.get_experiment
+        self._handlers["get_best_experiment"] = self.get_best_experiment
 
     def set_reflection_model(self, model) -> None:
         self.reflector = model_reflector(model)
@@ -164,10 +321,22 @@ class ExperimentToolExecutor(ToolExecutor):
         self.task_state.task_path.write_text(
             json.dumps(self.task_state.task, ensure_ascii=False, indent=2, allow_nan=False)+"\n", encoding="utf-8")
 
+    def _current_profile(self) -> dict:
+        state = self.task_state
+        if state is None:
+            return {}
+        profile = json.loads(state.profile_path.read_text(encoding="utf-8"))
+        if not isinstance(profile, dict):
+            raise ValueError("profile.json must contain a JSON object.")
+        state.task["profile"] = profile
+        self._save_task()
+        return profile
+
     def search_memory(self, *, query: str = "", limit: int = 5) -> dict:
         task = self.task_state.task if self.task_state else {}
         return {"mode": self.memory.mode, "experiences": self.memory.search(
-            query, limit, profile=task.get("profile"), primary_metric=task.get("primary_metric"))}
+            query, limit, profile=self._current_profile() if task else None,
+            primary_metric=task.get("primary_metric"))}
 
     def finish_task(self, *, reason: str = "Task completed.") -> dict:
         state = self.task_state
@@ -175,6 +344,7 @@ class ExperimentToolExecutor(ToolExecutor):
             raise ValueError("Call task_init first.")
         if state.task.get("status") == "ended":
             return self.finish_result or {"status": "ended", "memory_warning": "No memory result available; recovery is not implemented."}
+        self._current_profile()
         state.task["status"] = "ended"
         state.task["end_reason"] = reason
         state.task["ended_at"] = datetime.now(timezone.utc).isoformat()
@@ -193,6 +363,42 @@ class ExperimentToolExecutor(ToolExecutor):
         self.attempts.append(deepcopy(attempt))
         with (self.task_dir / "attempts.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(attempt, ensure_ascii=False, allow_nan=False)+"\n")
+
+    def _baselines(self, state: TaskState) -> dict[str, dict]:
+        results = {}
+        with Path(state.task["data"]["eval"]).open(encoding="utf-8-sig", newline="") as stream:
+            eval_rows = sum(1 for _ in csv.reader(stream)) - 1
+        train_rows = state.task["profile"]["training_rows"]
+        win_len = min(16, max(2, train_rows // 4), eval_rows)
+        for name in BASELINE_DETECTORS:
+            params = {}
+            if name in {"SubLOF", "SubOCSVM", "SubPCA"}:
+                if train_rows <= win_len or eval_rows < 2:
+                    results[name] = {
+                        "params": None, "metrics": None,
+                        "error": "Windowed baselines need at least 3 training rows and 2 evaluation rows.",
+                    }
+                    continue
+                params["win_len"] = win_len
+                if name == "SubLOF":
+                    params["n_neighbors"] = min(20, train_rows - win_len)
+            spec = state.experiment_spec([{"class": name, "params": params}])
+            with TemporaryDirectory(dir=state.task_dir) as directory:
+                work_dir = Path(directory)
+                spec_path = work_dir / "spec.json"
+                spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+                try:
+                    result = self._libraryts(
+                        "run", "--spec", str(spec_path), "--output-dir", str(work_dir / "output")
+                    )
+                    metrics = result.get("metrics") if isinstance(result, dict) else None
+                    if not isinstance(metrics, dict):
+                        raise HarnessExecutionError("LibraryTS returned no evaluation metrics.")
+                except (RuntimeError, HarnessExecutionError) as exc:
+                    results[name] = {"params": params, "metrics": None, "error": str(exc)}
+                else:
+                    results[name] = {"params": params, "metrics": metrics, "error": None}
+        return results
 
     def task_init(
         self,
@@ -239,10 +445,23 @@ class ExperimentToolExecutor(ToolExecutor):
             library_version = version("libraryts")
         except PackageNotFoundError:
             library_version = None
+        training = training_profile(Path(paths["train"]))
+        observations = [{
+            "finding": "Training series structure",
+            "evidence": f"{training['training_rows']} rows; {training['numeric_features']} numeric features; "
+                        f"missing ratio {training['missing_ratio']}",
+            "implication": "Consider missing values and feature count when selecting preprocessing and detectors.",
+        }]
+        profile = {
+            **training,
+            "length": training["training_rows"],
+            "missing_ratio": training["missing_ratio"],
+            "observations": observations,
+        }
         task = {
             "status": "active", "memory_mode": self.memory.mode, "update_memory": self.update_memory,
             "task_description": full_description,
-            "profile": training_profile(Path(paths["train"])),
+            "profile": profile,
             "software": {"python": platform.python_version(), "libraryts": library_version},
             "objective": objective.strip(),
             "data": paths,
@@ -276,6 +495,13 @@ class ExperimentToolExecutor(ToolExecutor):
             self.task_state = TaskState(task_dir)
         else:
             self.task_state = TaskState.create(task_dir, task)
+        state = self.task_state
+        baselines = self._baselines(state)
+        profile["baselines"] = baselines
+        state.profile_path.write_text(
+            json.dumps(profile, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+        )
+        self._save_task()
         self.attempts = []
         self.finish_result = None
         self.pending_user_text = []
@@ -284,9 +510,11 @@ class ExperimentToolExecutor(ToolExecutor):
             "memory": self.search_memory(),
             "task_dir": str(self.task_state.task_dir),
             "task_path": str(self.task_state.task_path),
+            "profile_path": str(state.profile_path),
             "history_path": str(self.task_state.history_path),
             "experiments_dir": str(self.task_state.experiments_dir),
             "task": self.task_state.task,
+            "baselines": baselines,
         }
 
     def list_components(self, *, kind: str, name: str | None = None) -> dict:
@@ -322,23 +550,7 @@ class ExperimentToolExecutor(ToolExecutor):
             if step.keys() - {"class", "params"} or not isinstance(params, dict):
                 raise ValueError("Pipeline steps accept a class and an optional params object.")
 
-        task_data = state.task["data"]
-        data = {"train": task_data["train"], "test": task_data["eval"]}
-        if task_data.get("val") is not None:
-            data["val"] = task_data["val"]
-
-        # 构建好实验 spec
-        spec = {
-            "task": "anomaly_detection",
-            "data": data,
-            "estimator": [
-                {"class": step["class"], "init_params": step.get("params", {})}
-                for step in pipeline
-            ],
-            "metrics": state.task["metrics"],
-            "seed": state.task["seed"],
-        }
-        content = json.dumps(spec, ensure_ascii=False, indent=2, allow_nan=False)
+        spec = state.experiment_spec(pipeline)
         attempt = {
             "task_description": state.task["task_description"],
             "pipeline": deepcopy(pipeline), "seed": state.task["seed"], "reason": reason,
@@ -346,12 +558,11 @@ class ExperimentToolExecutor(ToolExecutor):
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         # Reserve outside the catch: a budget rejection is not an executed attempt.
-        with state.prepare_trial() as pending:
+        with state.create_trial(spec) as pending:
             started = perf_counter()
             try:
-                pending.spec_path.write_text(content + "\n", encoding="utf-8")
-                metrics = self._evaluate_spec(pending.spec_path, pending.output_dir)
-                trial = state.record_trial(pending, metrics, reason=reason)
+                metrics = self._evaluate_spec(pending.spec_path, pending.experiment_dir)
+                trial = state.record_trial(pending, metrics=metrics, reason=reason)
             except Exception as exc:
                 error = str(exc)
                 lowered = error.lower()
@@ -369,19 +580,68 @@ class ExperimentToolExecutor(ToolExecutor):
             "experiment_id": trial["experiment_id"], "status": trial["status"],
             "timestamp": trial["timestamp"],
             "progress": f"{trial['trial_number']:02d}/{state.task['max_trials']}",
-            "spec_path": trial["spec_path"], "output_dir": trial["output_dir"],
+            "spec_path": trial["spec_path"], "experiment_dir": trial["experiment_dir"],
             "metrics": trial["metrics"], "best_experiment": best,
         }
         if state.recorded_trials >= state.task["max_trials"]:
             result["task_completion"] = self.finish_task(reason="Trial budget exhausted.")
         return result
 
+    def get_history(self) -> dict[str, Any]:
+        if self.task_state is None:
+            raise ValueError("No active task.")
+        history = self.task_state.history
+        return {
+            "status": "Retrieved the trial history." if history else "No successful trials yet.",
+            "trial_history": history,
+        }
+
+    def get_experiment(self, experiment_id: str) -> dict[str, Any]:
+        if self.task_state is None:
+            raise ValueError("No active task.")
+        return {
+            "status": f"Retrieved experiment {experiment_id}.",
+            "experiment": self.task_state.get_experiment(experiment_id),
+        }
+
+    def get_best_experiment(self) -> dict[str, Any]:
+        if self.task_state is None:
+            raise ValueError("No active task.")
+        best = self.task_state.best_experiment
+        return {
+            "status": "Retrieved the best experiment." if best is not None else "No successful trials yet.",
+            "best_experiment": best,
+        }
+
     def _evaluate_spec(self, spec_path: Path, output_dir: Path) -> dict:
-        result = self._libraryts("run", "--spec", str(spec_path), "--output-dir", str(output_dir))
-        metrics = result.get("metrics") if isinstance(result, dict) else None
-        if not isinstance(metrics, dict):
-            raise HarnessExecutionError("LibraryTS returned no evaluation metrics.")
-        return metrics
+        with TemporaryDirectory(dir=self.task_dir) as directory:
+            run_dir = Path(directory) / "output"
+            result = self._libraryts("run", "--spec", str(spec_path), "--output-dir", str(run_dir))
+            metrics = result.get("metrics") if isinstance(result, dict) else None
+            if not isinstance(metrics, dict):
+                raise HarnessExecutionError("LibraryTS returned no evaluation metrics.")
+            artifacts = {
+                "model": run_dir / "model" / "model.zip",
+                "scores": run_dir / "prediction" / "scores.csv",
+                "metrics": run_dir / "evaluation" / "metrics.json",
+            }
+            for name, source in artifacts.items():
+                if not source.is_file():
+                    raise HarnessExecutionError(f"LibraryTS returned no {name} artifact: {source}")
+            files = {}
+            for name, source in artifacts.items():
+                target = output_dir / source.name
+                copy2(source, target)
+                files[name] = target.name
+            manifest = {
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "files": {"spec": spec_path.name, **files},
+            }
+            (output_dir / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            return metrics
 
     def _libraryts(self, *args: str) -> dict | list:
         result = run_bash(

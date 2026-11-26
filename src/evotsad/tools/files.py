@@ -2,6 +2,8 @@
 
 from base64 import b64encode
 from pathlib import Path
+from shutil import copymode
+from tempfile import TemporaryDirectory
 
 from openai.types.responses import ResponseFunctionCallOutputItemListParam
 
@@ -25,7 +27,7 @@ def read_file(cwd: Path, path: str) -> dict:
     source = workspace_path(cwd, path)
     if not source.is_file():
         raise ValueError("The requested path must be a file.")
-    with source.open(encoding="utf-8") as handle:
+    with source.open(encoding="utf-8", newline="") as handle:
         content = handle.read(READ_LIMIT + 1)
     return {
         "path": str(source.relative_to(cwd)),
@@ -59,3 +61,22 @@ def write_file(cwd: Path, path: str, content: str) -> dict:
     with target.open("x", encoding="utf-8") as handle:
         handle.write(content)
     return {"path": str(relative)}
+
+
+def edit_file(cwd: Path, path: str, old_text: str, new_text: str) -> dict:
+    """Replace one exact, nonempty match in an existing UTF-8 file."""
+    target = workspace_path(cwd, path)
+    if not old_text:
+        raise ValueError("old_text must not be empty.")
+    with target.open(encoding="utf-8", newline="") as handle:
+        content = handle.read()
+    if old_text not in content:
+        raise ValueError("old_text was not found. Read the file to check the exact text.")
+    if content.count(old_text) != 1:
+        raise ValueError("old_text matches more than once. Include more surrounding text.")
+    with TemporaryDirectory(dir=target.parent) as directory:
+        replacement = Path(directory) / "edited"
+        replacement.write_text(content.replace(old_text, new_text, 1), encoding="utf-8", newline="")
+        copymode(target, replacement)
+        replacement.replace(target)
+    return {"path": str(target.relative_to(cwd))}
