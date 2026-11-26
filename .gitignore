@@ -25,3 +25,4 @@ data/
 docs/
 .evotsad/
 .agent/
+!.agent/config.toml
