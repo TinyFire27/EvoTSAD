@@ -73,6 +73,24 @@ $env:PYTHONPATH = "src"
 
 此开关只禁止长期记忆写入，当前任务的 `.evotsad/` 日志仍会正常保存。
 
+## 批量会话
+
+从仓库目录执行批量入口；每个 JSONL 行都是一个独立的新会话，行内 `tasks` 按顺序作为用户消息发送到与 `chat` 相同的代理循环。每个任务的 `prompt` 应包含聊天时会输入的完整要求（包括数据路径和试验预算），不支持 `/new`、`/image` 等交互式终端命令；如需结束任务以发布经验，也应在会话中提供相应的后续消息。会话之间顺序执行，先结束的会话所发布的记忆可供之后的会话读取。
+
+```jsonl
+{"memory_mode":"all","update_memory":true,"tasks":[{"prompt":"使用 train.csv 和 eval.csv 检测异常，最多运行 3 次试验。"},{"prompt":"请总结最佳模型并结束当前任务。"}]}
+{"memory_mode":"case_bank","update_memory":false,"model":"provider/model","title":"复测","tasks":[{"prompt":"使用另一组训练及评估数据运行 2 次试验。"}]}
+```
+
+`memory_mode` 默认为 `all`，可选值与交互模式相同；`update_memory` 默认为 `true`，等价于是否设置 `--no-update-memory`。`model` 和 `title` 可选，省略时使用默认模型和会话标题。
+
+```powershell
+.\.venv\Scripts\python.exe -m evotsad.batch sessions.jsonl answers.jsonl
+```
+
+输出文件必须尚不存在。每行对应输入的一行，保留原有字段和任务顺序，并为每个任务增加 `response`（模型最终文本）。批量运行仍会在 `.agent/sessions/` 保留普通聊天会话，并在 `.evotsad/` 保存当前任务产物。遇到失败时，会在该任务写入 `error` 后停止；输出文件保留此前已完成的会话，但不会自动续跑。
+
+
 ## 任务使用流程
 
 启动后直接输入任务要求。代理会在信息齐全后调用 `task_init`，需要提供：
